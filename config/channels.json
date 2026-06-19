@@ -1,0 +1,6 @@
+{
+  "_comment": "இங்கே வேண்டிய channel IDs மட்டும் வையுங்கள். Empty array [] = எல்லா channels-ம் fetch ஆகும்.",
+  "_tip": "Channel IDs தெரியவில்லையா? 'python grab_epg.py --list-channels' run பண்ணுங்கள்",
+
+  "channels": []
+}
