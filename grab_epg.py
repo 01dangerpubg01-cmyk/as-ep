@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
 """
 Astro Malaysia EPG Grabber
-Source: content.astro.com.my (via contenthub-api.eco.astro.com.my)
+Source: contenthub-api.eco.astro.com.my
 
-Endpoints (verified from iptv-org/epg source):
-  - All channels : https://contenthub-api.eco.astro.com.my/channel/all.json
-  - Schedule     : https://contenthub-api.eco.astro.com.my/channel/{id}.json
-                   Response: { response: { schedule: { "YYYY-MM-DD": [ items ] } } }
-  - Details      : https://contenthub-api.eco.astro.com.my/api/v1/linear-detail?siTrafficKey=X
+Endpoints:
+  - Channels : /channel/all.json
+  - Schedule : /channel/{id}.json  →  response.schedule["YYYY-MM-DD"] = [items]
+  - Details  : /api/v1/linear-detail?siTrafficKey=X
 
-Schedule item keys (from iptv-org source):
+Item fields (from iptv-org/epg source):
   datetimeInUtc, duration, title, subtitles, siTrafficKey
 
-Archive logic:
-  - Past  : keep last 14 days
-  - Future: probe day by day until 2 consecutive empty days
+Archive:
+  - Past  : keep 14 days
+  - Future: probe until 2 consecutive empty days
 """
 
 import argparse
@@ -51,7 +50,7 @@ ALL_CHANNELS  = f"{BASE_API}/channel/all.json"
 CHANNEL_SCHED = f"{BASE_API}/channel/{{site_id}}.json"
 PROG_DETAIL   = f"{BASE_API}/api/v1/linear-detail"
 
-TIMEZONE       = timezone(timedelta(hours=8))   # MYT / UTC+8
+MYT            = timezone(timedelta(hours=8))
 DATE_FMT_XMLTV = "%Y%m%d%H%M%S %z"
 DATE_FMT_DAY   = "%Y-%m-%d"
 KEEP_PAST_DAYS = 14
@@ -69,7 +68,7 @@ HEADERS = {
 # HTTP
 # ---------------------------------------------------------------------------
 
-def get_json(url: str, params: dict = None, retries: int = 3):
+def get_json(url, params=None, retries=3):
     for attempt in range(1, retries + 1):
         try:
             r = requests.get(url, headers=HEADERS, params=params, timeout=30)
@@ -86,89 +85,123 @@ def get_json(url: str, params: dict = None, retries: int = 3):
     return None
 
 # ---------------------------------------------------------------------------
-# DateTime
+# DateTime — handle ALL possible formats Astro API might return
 # ---------------------------------------------------------------------------
 
-def utc_to_myt(dt_str: str):
-    """UTC string from API → MYT aware datetime."""
-    if not dt_str:
+_SAMPLE_LOGGED = False   # log unknown format once only
+
+def parse_start_time(raw):
+    """
+    Convert Astro API datetime string → MYT-aware datetime.
+    Handles multiple possible formats and logs unrecognised ones.
+    """
+    global _SAMPLE_LOGGED
+    if not raw:
         return None
-    for fmt in ("%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%dT%H:%M:%S.%fZ",
-                "%Y-%m-%dT%H:%M:%S",  "%Y-%m-%d %H:%M:%S"):
+
+    s = str(raw).strip()
+
+    # Format 1: ISO UTC  "2026-06-19T14:00:00Z"
+    # Format 2: ISO UTC ms "2026-06-19T14:00:00.000Z"
+    # Format 3: space sep "2026-06-19 14:00:00"
+    # Format 4: epoch integer / float
+    # Format 5: already offset "+0800" aware string
+
+    # Try epoch number first
+    try:
+        ts = float(s)
+        return datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(MYT)
+    except (ValueError, OSError):
+        pass
+
+    # Try ISO / space formats
+    clean = s.replace("Z", "+00:00")
+    for fmt in (
+        "%Y-%m-%dT%H:%M:%S.%f+00:00",
+        "%Y-%m-%dT%H:%M:%S+00:00",
+        "%Y-%m-%dT%H:%M:%S.%f",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S.%f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%d %H:%M",
+    ):
         try:
-            dt = datetime.strptime(dt_str[:len(fmt)], fmt)
-            return dt.replace(tzinfo=timezone.utc).astimezone(TIMEZONE)
+            dt = datetime.strptime(clean[:len(fmt)], fmt)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.astimezone(MYT)
         except ValueError:
             continue
+
+    # Try Python fromisoformat (Python 3.7+)
+    try:
+        dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(MYT)
+    except ValueError:
+        pass
+
+    # Unknown — log sample once
+    if not _SAMPLE_LOGGED:
+        log.warning("UNKNOWN datetime format — sample: %r  (will skip these items)", s)
+        _SAMPLE_LOGGED = True
     return None
 
 
-def parse_xmltv_dt(dt_str: str):
+def parse_xmltv_dt(dt_str):
     if not dt_str:
         return None
     for fmt in ("%Y%m%d%H%M%S %z", "%Y%m%d%H%M%S"):
         try:
             dt = datetime.strptime(dt_str.strip()[:len(fmt)], fmt)
-            return dt if dt.tzinfo else dt.replace(tzinfo=TIMEZONE)
+            return dt if dt.tzinfo else dt.replace(tzinfo=MYT)
         except ValueError:
             continue
     return None
 
 
-def parse_duration(dur: str) -> int:
-    """'HH:MM:SS' → seconds."""
+def parse_duration(dur):
     try:
-        parts = [int(x) for x in dur.split(":")]
+        parts = [int(x) for x in str(dur).split(":")]
         return parts[0] * 3600 + parts[1] * 60 + (parts[2] if len(parts) > 2 else 0)
     except Exception:
-        return 1800   # default 30 min
+        return 1800
 
 # ---------------------------------------------------------------------------
 # Fetch channels
 # ---------------------------------------------------------------------------
 
-def fetch_all_channels(channel_ids: list = None) -> list:
+def fetch_all_channels(channel_ids=None):
     log.info("Fetching channel list ...")
     data = get_json(ALL_CHANNELS)
     if not data:
         log.error("Cannot fetch channels — exiting.")
         sys.exit(1)
-
     channels = data.get("response", []) if isinstance(data, dict) else data
     log.info("API returned %d channels.", len(channels))
-
     if channel_ids:
         channels = [c for c in channels if c.get("id") in channel_ids]
         log.info("Filtered to %d channels.", len(channels))
-
     return channels
 
 # ---------------------------------------------------------------------------
 # Fetch schedule
 # ---------------------------------------------------------------------------
 
-def fetch_schedule(site_id) -> dict:
-    """
-    Returns schedule dict keyed by date: { "YYYY-MM-DD": [ items... ] }
-    Each item has: datetimeInUtc, duration, title, subtitles, siTrafficKey, ...
-    """
-    url  = CHANNEL_SCHED.format(site_id=site_id)
-    data = get_json(url)
+def fetch_schedule(site_id):
+    data = get_json(CHANNEL_SCHED.format(site_id=site_id))
     if not data:
         return {}
-
-    # Response structure: { "response": { "schedule": { "2026-06-19": [...] } } }
-    resp     = data.get("response", {}) if isinstance(data, dict) else {}
-    schedule = resp.get("schedule", {})
-
-    # Fallback: sometimes schedule is at top level
-    if not schedule and isinstance(data, dict):
-        schedule = data.get("schedule", {})
-
-    return schedule if isinstance(schedule, dict) else {}
+    resp = data.get("response", {}) if isinstance(data, dict) else {}
+    sched = resp.get("schedule", {})
+    # Some channels return schedule at top level
+    if not sched and isinstance(data, dict):
+        sched = data.get("schedule", {})
+    return sched if isinstance(sched, dict) else {}
 
 
-def fetch_details(si_key: str) -> dict:
+def fetch_details(si_key):
     if not si_key:
         return {}
     data = get_json(PROG_DETAIL, params={"siTrafficKey": si_key})
@@ -177,17 +210,30 @@ def fetch_details(si_key: str) -> dict:
     return data.get("response", {}) if isinstance(data, dict) else {}
 
 # ---------------------------------------------------------------------------
-# Collect events (probe future until empty)
+# Collect events
 # ---------------------------------------------------------------------------
 
-def collect_events(channel: dict, today: datetime) -> tuple:
+def collect_events(channel, today):
     site_id  = str(channel.get("id", ""))
     ch_name  = (channel.get("title") or site_id)[:35]
     schedule = fetch_schedule(site_id)
 
     if not schedule:
-        log.info("  %-35s  no schedule returned", ch_name)
+        log.info("  %-35s  no schedule", ch_name)
         return site_id, []
+
+    # Log first item's raw fields once per channel (to detect field names)
+    first_date = list(schedule.keys())[0] if schedule else None
+    if first_date:
+        items_sample = schedule[first_date]
+        if items_sample:
+            sample = items_sample[0]
+            log.info("  %-35s  SAMPLE KEYS: %s", ch_name, list(sample.keys()))
+            log.info("  %-35s  datetimeInUtc=%r  duration=%r  title=%r",
+                     ch_name,
+                     sample.get("datetimeInUtc"),
+                     sample.get("duration"),
+                     sample.get("title"))
 
     all_items    = []
     empty_streak = 0
@@ -200,40 +246,50 @@ def collect_events(channel: dict, today: datetime) -> tuple:
         if items:
             all_items.extend(items)
             empty_streak = 0
-            log.info("  %-35s  %s  →  %d items", ch_name, date_key, len(items))
         else:
             empty_streak += 1
             if empty_streak >= 2:
                 break
-
         day += 1
 
+    log.info("  %-35s  total %d items across %d days", ch_name, len(all_items), day - 2)
     return site_id, all_items
 
 # ---------------------------------------------------------------------------
 # Build programme element
 # ---------------------------------------------------------------------------
 
-def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | None:
-    """
-    item fields from schedule API:
-      title          - programme title
-      datetimeInUtc  - UTC start time
-      duration       - "HH:MM:SS"
-      subtitles      - episode subtitle
-      siTrafficKey   - key for detail API call
-      shortSynopsis  - sometimes present directly in schedule item
-      longSynopsis   - sometimes present directly in schedule item
-    """
-    # --- Start time ---
-    start_dt = utc_to_myt(item.get("datetimeInUtc", ""))
+def build_programme_el(item, ch_id, with_details):
+    # Start time — try datetimeInUtc first, then other possible keys
+    raw_dt = (
+        item.get("datetimeInUtc") or
+        item.get("datetime_in_utc") or
+        item.get("startDateTimeUtc") or
+        item.get("startTime") or
+        item.get("start_time") or
+        item.get("airTime") or
+        item.get("scheduleStartTime") or
+        ""
+    )
+    start_dt = parse_start_time(raw_dt)
     if not start_dt:
         return None
 
-    # --- Duration / stop ---
-    stop_dt = start_dt + timedelta(seconds=parse_duration(item.get("duration", "")))
+    dur_raw = (
+        item.get("duration") or
+        item.get("durationInSeconds") or
+        item.get("runTime") or
+        "00:30:00"
+    )
+    # duration might be seconds integer
+    if isinstance(dur_raw, (int, float)):
+        dur_secs = int(dur_raw)
+    else:
+        dur_secs = parse_duration(str(dur_raw))
 
-    # --- Title: directly in schedule item ---
+    stop_dt = start_dt + timedelta(seconds=dur_secs)
+
+    # Title
     title = (
         item.get("programmeTitle") or
         item.get("title") or
@@ -242,7 +298,7 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
         "Unknown"
     )
 
-    # --- Description: try from schedule item first ---
+    # Description
     desc = (
         item.get("longSynopsis") or
         item.get("shortSynopsis") or
@@ -251,11 +307,10 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
         ""
     )
 
-    # --- Optional: fetch richer details ---
+    # Optional detail call
     details = {}
     if with_details and item.get("siTrafficKey"):
         details = fetch_details(item["siTrafficKey"])
-
     if details:
         title = details.get("title") or title
         desc  = details.get("longSynopsis") or details.get("shortSynopsis") or desc
@@ -266,7 +321,6 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
     cast_str = details.get("cast") or item.get("cast") or ""
     dir_str  = details.get("director") or item.get("director") or ""
 
-    # --- Genre from subFilter ---
     GENRE_MAP = {
         "filter/2": "Action", "filter/4": "Anime", "filter/12": "Cartoons",
         "filter/16": "Comedy", "filter/19": "Crime", "filter/24": "Drama",
@@ -278,25 +332,19 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
     sub_filters = details.get("subFilter") or item.get("subFilter") or []
     genres = []
     if isinstance(sub_filters, list):
-        genres = [GENRE_MAP[sf.lower()] for sf in sub_filters if sf.lower() in GENRE_MAP]
-
-    # Fallback genre from item
+        genres = [GENRE_MAP[sf.lower()] for sf in sub_filters if isinstance(sf, str) and sf.lower() in GENRE_MAP]
     if not genres and item.get("genre"):
         genres = [item["genre"]]
 
-    # --- Episode / Season ---
     ep_num = item.get("episodeNumber") or details.get("episodeNumber")
     sn_num = item.get("seasonNumber")  or details.get("seasonNumber")
     if not ep_num:
         m = re.search(r"Ep(\d+)$", item.get("title") or "")
-        if m:
-            ep_num = int(m.group(1))
+        if m: ep_num = int(m.group(1))
     if not sn_num:
         m = re.search(r" S(\d+)", title)
-        if m:
-            sn_num = int(m.group(1))
+        if m: sn_num = int(m.group(1))
 
-    # --- Build element ---
     prog = Element(
         "programme",
         start=start_dt.strftime(DATE_FMT_XMLTV),
@@ -305,37 +353,28 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
     )
 
     SubElement(prog, "title", lang="en").text = title
-
     if subtitle:
         SubElement(prog, "sub-title", lang="en").text = subtitle
-
     if desc:
         SubElement(prog, "desc", lang="en").text = desc
-
     for g in genres:
         SubElement(prog, "category", lang="en").text = g
-
     if sn_num or ep_num:
         ep_el = SubElement(prog, "episode-num", system="xmltv_ns")
         s = str(int(sn_num) - 1) if sn_num else ""
         e = str(int(ep_num) - 1) if ep_num else ""
         ep_el.text = f"{s}.{e}."
-
     if image:
         SubElement(prog, "icon", src=image)
-
     if cert:
         r_el = SubElement(prog, "rating", system="LPF")
         SubElement(r_el, "value").text = cert
-
     actors    = [a.strip() for a in cast_str.split(",") if a.strip()] if cast_str else []
     directors = [d.strip() for d in dir_str.split(",") if d.strip()] if dir_str else []
     if actors or directors:
         cr = SubElement(prog, "credits")
-        for d in directors:
-            SubElement(cr, "director").text = d
-        for a in actors:
-            SubElement(cr, "actor").text = a
+        for d in directors: SubElement(cr, "director").text = d
+        for a in actors:    SubElement(cr, "actor").text = a
 
     return prog
 
@@ -343,7 +382,7 @@ def build_programme_el(item: dict, ch_id: str, with_details: bool) -> Element | 
 # Build channel element
 # ---------------------------------------------------------------------------
 
-def build_channel_el(ch: dict) -> Element:
+def build_channel_el(ch):
     site_id = str(ch.get("id", ""))
     name    = ch.get("title") or site_id
     number  = str(ch.get("channelNumber") or ch.get("number") or "")
@@ -351,10 +390,8 @@ def build_channel_el(ch: dict) -> Element:
 
     el = Element("channel", id=site_id)
     SubElement(el, "display-name", lang="en").text = name
-    if number:
-        SubElement(el, "display-name").text = number
-    if logo:
-        SubElement(el, "icon", src=logo)
+    if number: SubElement(el, "display-name").text = number
+    if logo:   SubElement(el, "icon", src=logo)
     SubElement(el, "url").text = f"https://content.astro.com.my/channels/{number}"
     return el
 
@@ -362,38 +399,27 @@ def build_channel_el(ch: dict) -> Element:
 # Load + trim existing XML
 # ---------------------------------------------------------------------------
 
-def load_existing_xml(path: Path, keep_days: int):
-    ch_map   = {}
-    prog_map = {}
-
+def load_existing_xml(path, keep_days):
+    ch_map = {}; prog_map = {}
     if not path.exists():
         log.info("No existing XML — starting fresh.")
         return ch_map, prog_map
-
     try:
         root = et_parse(str(path)).getroot()
     except Exception as e:
         log.warning("Cannot parse existing XML (%s) — starting fresh.", e)
         return ch_map, prog_map
-
-    cutoff = datetime.now(tz=TIMEZONE) - timedelta(days=keep_days)
+    cutoff = datetime.now(tz=MYT) - timedelta(days=keep_days)
     kept = dropped = 0
-
     for el in root.findall("channel"):
         ch_map[el.get("id", "")] = el
-
     for el in root.findall("programme"):
         dt = parse_xmltv_dt(el.get("start", ""))
         if dt and dt < cutoff:
-            dropped += 1
-            continue
+            dropped += 1; continue
         prog_map.setdefault(el.get("channel", ""), []).append(el)
         kept += 1
-
-    log.info(
-        "Loaded XML — %d channels | %d kept | %d expired (>%d days) removed.",
-        len(ch_map), kept, dropped, keep_days,
-    )
+    log.info("Loaded XML — %d channels | %d kept | %d expired removed.", len(ch_map), kept, dropped)
     return ch_map, prog_map
 
 # ---------------------------------------------------------------------------
@@ -406,50 +432,37 @@ def merge_and_write(out_path, api_channels, new_events, old_ch_map, old_prog_map
     root.set("source-info-name",    "Astro Malaysia")
     root.set("source-info-url",     "https://content.astro.com.my/channels")
 
-    # Channels
     seen = set()
     for ch in api_channels:
         root.append(build_channel_el(ch))
         seen.add(str(ch.get("id", "")))
     for ch_id, el in old_ch_map.items():
-        if ch_id not in seen:
-            root.append(el)
+        if ch_id not in seen: root.append(el)
 
-    # Programmes — keyed by (ch_id, start) for dedup
     merged = {}
-
-    # 1. Old archive (already trimmed)
     for ch_id, progs in old_prog_map.items():
         for p in progs:
             merged[(ch_id, p.get("start", ""))] = p
 
-    # 2. New from API
     new_added = replaced = skipped = 0
     for ch in api_channels:
         ch_id = str(ch.get("id", ""))
-        items = new_events.get(ch_id, [])
-        for item in items:
+        for item in new_events.get(ch_id, []):
             el = build_programme_el(item, ch_id, with_details)
-            if el is None:
-                skipped += 1
-                continue
+            if el is None: skipped += 1; continue
             key = (ch_id, el.get("start", ""))
-            if key in merged:
-                replaced += 1
-            else:
-                new_added += 1
+            if key in merged: replaced += 1
+            else:             new_added += 1
             merged[key] = el
 
     for _, el in sorted(merged.items()):
         root.append(el)
 
-    total    = len(merged)
-    archived = total - new_added - replaced
+    total = len(merged)
     log.info(
-        "Merge — %d total programmes | %d new | %d updated | %d archive | %d skipped (no time).",
-        total, new_added, replaced, archived, skipped,
+        "Merge — %d total | %d new | %d updated | %d archive | %d skipped (no time).",
+        total, new_added, replaced, total - new_added - replaced, skipped,
     )
-
     indent(root, space="  ")
     out_path.parent.mkdir(parents=True, exist_ok=True)
     ElementTree(root).write(str(out_path), encoding="utf-8", xml_declaration=True)
@@ -460,33 +473,20 @@ def merge_and_write(out_path, api_channels, new_events, old_ch_map, old_prog_map
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(
-        description="Astro EPG grabber — past 14 days kept, future unlimited",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python grab_epg.py
-  python grab_epg.py --config config/channels.json --workers 10
-  python grab_epg.py --channels 397 167 358 --workers 5
-  python grab_epg.py --list-channels
-  python grab_epg.py --no-details    (faster, skips per-programme detail API)
-        """,
-    )
-    p.add_argument("-o", "--output",    default="astro_epg.xml")
-    p.add_argument("-w", "--workers",   type=int, default=5)
-    p.add_argument("-c", "--channels",  nargs="*", type=int)
+    p = argparse.ArgumentParser(description="Astro EPG grabber")
+    p.add_argument("-o", "--output",   default="astro_epg.xml")
+    p.add_argument("-w", "--workers",  type=int, default=5)
+    p.add_argument("-c", "--channels", nargs="*", type=int)
     p.add_argument("--config")
-    p.add_argument("--keep-days",       type=int, default=KEEP_PAST_DAYS)
-    p.add_argument("--no-details",      action="store_true",
-                   help="Skip per-programme detail API calls (faster, basic title+time only)")
-    p.add_argument("--list-channels",   action="store_true")
+    p.add_argument("--keep-days",      type=int, default=KEEP_PAST_DAYS)
+    p.add_argument("--no-details",     action="store_true")
+    p.add_argument("--list-channels",  action="store_true")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
 
-    # Load channel filter from config
     channel_ids = args.channels or []
     if args.config and not channel_ids:
         cfg_path = Path(args.config)
@@ -507,20 +507,17 @@ def main():
         return
 
     if not api_channels:
-        log.error("No channels found — exiting.")
+        log.error("No channels — exiting.")
         sys.exit(1)
 
     out_path = Path(args.output)
-
-    # Step 1: Load + trim existing XML
     old_ch_map, old_prog_map = load_existing_xml(out_path, args.keep_days)
 
-    # Step 2: Fetch schedule from today onwards
-    today = datetime.now(tz=TIMEZONE).replace(hour=0, minute=0, second=0, microsecond=0)
+    today = datetime.now(tz=MYT).replace(hour=0, minute=0, second=0, microsecond=0)
     log.info(
         "Fetching from %s for %d channel(s) with %d workers%s ...",
         today.strftime(DATE_FMT_DAY), len(api_channels), args.workers,
-        " [no-details mode]" if args.no_details else " [with details]",
+        " [no-details]" if args.no_details else " [with details]",
     )
 
     new_events = {}
@@ -531,18 +528,13 @@ def main():
                 site_id, items = fut.result()
                 new_events[site_id] = items
             except Exception as e:
-                ch = futures[fut]
-                log.error("Failed %s — %s", ch.get("title"), e)
+                log.error("Failed %s — %s", futures[fut].get("title"), e)
 
     total = sum(len(v) for v in new_events.values())
-    log.info("Schedule fetch done — %d total items.", total)
+    log.info("Fetch done — %d total items.", total)
 
-    # Step 3: Merge + write
-    merge_and_write(
-        out_path, api_channels, new_events,
-        old_ch_map, old_prog_map,
-        with_details=not args.no_details,
-    )
+    merge_and_write(out_path, api_channels, new_events, old_ch_map, old_prog_map,
+                    with_details=not args.no_details)
 
 
 if __name__ == "__main__":
