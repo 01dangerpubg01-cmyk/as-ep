@@ -2,11 +2,6 @@
 """
 Astro Malaysia EPG Grabber
 ---------------------------
-Logic:
-  - Past  : 14 நாளுக்கு பழையது delete, மீதி keep
-  - Future : API எவ்வளவு நாள் data தருகிறதோ அனைத்தும் fetch
-             (2 consecutive empty days வரும் வரை தொடரும் — no hard limit)
-  - தினமும் run → XML accumulate ஆகும், overwrite ஆகாது
 """
 
 import argparse
