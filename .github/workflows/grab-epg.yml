@@ -6,6 +6,10 @@ on:
 
   workflow_dispatch:
     inputs:
+      debug:
+        description: "Run in debug mode (prints raw API response)"
+        required: false
+        default: "false"
       keep_days:
         description: "Days of past EPG to keep (default: 14)"
         required: false
@@ -35,13 +39,16 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Debug API response (only when debug=true)
+        if: ${{ github.event.inputs.debug == 'true' }}
+        run: python debug_api.py
+
       - name: Grab & merge EPG data
         run: |
           python grab_epg.py \
             --output astro_epg.xml \
             --keep-days ${{ github.event.inputs.keep_days || '14' }} \
             --workers ${{ github.event.inputs.workers || '8' }} \
-            --config config/channels.json \
             --no-details
 
       - name: Commit EPG XML
