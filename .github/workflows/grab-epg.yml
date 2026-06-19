@@ -1,0 +1,62 @@
+name: Astro EPG Daily Grab
+
+on:
+  schedule:
+    # தினமும் இரவு 12:35 AM MYT (= 4:35 PM UTC previous day)
+    - cron: "35 16 * * *"
+
+  # Manual trigger
+  workflow_dispatch:
+    inputs:
+      keep_days:
+        description: "Days of past EPG to keep in archive (default: 14)"
+        required: false
+        default: "14"
+      workers:
+        description: "Parallel workers (default: 8)"
+        required: false
+        default: "8"
+
+jobs:
+  grab-epg:
+    name: Grab Astro EPG → XMLTV
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Grab & merge EPG data
+        run: |
+          python grab_epg.py \
+            --output astro_epg.xml \
+            --keep-days ${{ github.event.inputs.keep_days || '14' }} \
+            --workers ${{ github.event.inputs.workers || '8' }} \
+            --config config/channels.json
+
+      - name: Commit EPG XML
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add astro_epg.xml
+          git diff --staged --quiet || git commit -m "chore: update EPG $(date -u +'%Y-%m-%d %H:%M UTC')"
+          git push
+
+      - name: Upload as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: astro-epg-xml
+          path: astro_epg.xml
+          retention-days: 7
