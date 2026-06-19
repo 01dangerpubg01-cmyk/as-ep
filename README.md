@@ -3,6 +3,6 @@
 
 
 ```
-https://raw.githubusercontent.com/YOUR_USERNAME/astro-epg-grabber/main/astro_epg.xml
+https://raw.githubusercontent.com/01dangerpubg01-cmyk/astro-epg-grabber/main/astro_epg.xml
 ```
 
